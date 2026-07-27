@@ -1,0 +1,161 @@
+x-airflow-common: &airflow-common
+  build:
+    context: ..
+    dockerfile: infrastructure/airflow/Dockerfile
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-raguser}:${POSTGRES_PASSWORD:-changeme}@postgres/airflow
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+    AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth
+    # Global ceilings. The `embedding` pool (1 slot, created by airflow-init)
+    # is what actually protects memory; these keep the parse fan-out modest so
+    # docling parses don't starve the scheduler on a 4-core VM.
+    AIRFLOW__CORE__PARALLELISM: "4"
+    AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: "4"
+    PYTHONPATH: /opt/airflow
+    POSTGRES_HOST: postgres
+    POSTGRES_DB: ${POSTGRES_DB:-ragdb}
+    POSTGRES_USER: ${POSTGRES_USER:-raguser}
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    OPENSEARCH_URL: http://opensearch:9200
+    # Pinned explicitly rather than left to code defaults: EMBEDDING_DIM must
+    # match the knn_vector mapping in OpenSearch, and silent drift between the
+    # two is unrecoverable without a reindex.
+    EMBEDDING_MODEL: ${EMBEDDING_MODEL:-jinaai/jina-embeddings-v3}
+    EMBEDDING_DIM: ${EMBEDDING_DIM:-768}
+    EMBEDDING_TASK: ${EMBEDDING_TASK:-retrieval.passage}
+    EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE:-8}
+    HF_HOME: /opt/airflow/hf_cache
+  volumes:
+    - ../infrastructure/airflow/dags:/opt/airflow/dags
+    - ../src:/opt/airflow/src
+    - ingest_inbox:/opt/airflow/inbox
+    - hf_cache:/opt/airflow/hf_cache
+  depends_on:
+    postgres: { condition: service_healthy }
+    opensearch: { condition: service_healthy }
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-ragdb}
+      POSTGRES_USER: ${POSTGRES_USER:-raguser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    ports: ["5432:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ../migrations:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U raguser -d ragdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+
+  ollama:
+    image: ollama/ollama:latest
+    ports: ["11434:11434"]
+    volumes:
+      - ollama_models:/root/.ollama
+
+  opensearch:
+    image: opensearchproject/opensearch:2.19.0
+    environment:
+      discovery.type: single-node
+      DISABLE_SECURITY_PLUGIN: "true"
+      OPENSEARCH_JAVA_OPTS: "-Xms512m -Xmx512m"
+    ports: ["9200:9200"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  opensearch-dashboards:
+    image: opensearchproject/opensearch-dashboards:2.19.0
+    ports: ["5601:5601"]
+    environment:
+      OPENSEARCH_HOSTS: '["http://opensearch:9200"]'
+      DISABLE_SECURITY_DASHBOARDS_PLUGIN: "true"
+    depends_on:
+      opensearch: { condition: service_healthy }
+
+  app:
+    build:
+      context: ..
+      dockerfile: infrastructure/app.Dockerfile
+    ports: ["8000:8000"]
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: ${POSTGRES_DB:-ragdb}
+      POSTGRES_USER: ${POSTGRES_USER:-raguser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      OPENSEARCH_URL: http://opensearch:9200
+      REDIS_URL: redis://redis:6379/0
+      OLLAMA_BASE_URL: http://ollama:11434
+      AIRFLOW_BASE_URL: http://airflow-webserver:8080
+      INBOX_DIR: /inbox
+      # Same values as the Airflow side — the app embeds queries at search time
+      # (Step 1.6) and must produce vectors of the same width and geometry.
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-jinaai/jina-embeddings-v3}
+      EMBEDDING_DIM: ${EMBEDDING_DIM:-768}
+      EMBEDDING_TASK: ${EMBEDDING_TASK:-retrieval.passage}
+      EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE:-8}
+      # Explicit, not implicit: this happens to be HF's default cache path, and
+      # the hf_cache volume is mounted here so the ~2.2GB model download is
+      # shared with the Airflow containers instead of duplicated.
+      HF_HOME: /root/.cache/huggingface
+    volumes:
+      - ingest_inbox:/inbox
+      - hf_cache:/root/.cache/huggingface
+    depends_on:
+      postgres: { condition: service_healthy }
+      opensearch: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    user: "0:0"
+    command:
+      - -c
+      - >
+        chown airflow:root /opt/airflow/hf_cache &&
+        airflow db migrate &&
+        airflow pools set embedding 1 "one 5.4GB jina-v3 load at a time; 2 concurrent = OOM on an 8GB VM" &&
+        airflow users create --username ${AIRFLOW_USER:-airflow} --password ${AIRFLOW_PASSWORD:-airflow}
+        --firstname a --lastname b --role Admin --email admin@example.com || true
+    restart: "no"
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports: ["8080:8080"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      airflow-init: { condition: service_completed_successfully }
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      postgres: { condition: service_healthy }
+      airflow-init: { condition: service_completed_successfully }
+
+volumes:
+  pgdata:
+  ollama_models:
+  ingest_inbox:
+  hf_cache:
+
+networks:
+  default:
+    name: rag-network

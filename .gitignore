@@ -1,0 +1,19 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.venv-airflow
+
+# Secrets — never commit
+.env
+
+.claude
+.github
+
+.vscode
