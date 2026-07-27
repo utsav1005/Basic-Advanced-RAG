@@ -70,7 +70,13 @@ def ingest_document():
 
         return asyncio.run(embed_and_load_batch(payloads))
 
-    embed_and_load_task(extract_and_chunk_task.expand(item=collect_items()))
+    @task
+    def notify_success_task(results: list[dict]) -> None:
+        from src.services.ingestion.pipeline import notify_success
+
+        notify_success(results)
+
+    notify_success_task(embed_and_load_task(extract_and_chunk_task.expand(item=collect_items())))
 
 
 ingest_document()

@@ -13,6 +13,8 @@ N documents must share ONE loaded model rather than paying that N times in N
 task processes.
 """
 
+import logging
+
 from sqlalchemy import create_engine
 
 from src.config import settings
@@ -42,13 +44,26 @@ SOURCE_REGISTRY: dict[SourceType, DocumentSource] = {
 # enough for Postgres to drop a pooled connection; this revalidates first.
 _engine = create_engine(settings.postgres_dsn, pool_pre_ping=True)
 
+_logger = logging.getLogger(__name__)
+
+
+def validate_document(raw: bytes, filename: str, source_type: SourceType) -> None:
+    """Cheap sanity checks before spending a parse on this upload. Raises
+    ValueError with a message specific enough to show up usefully in an
+    Airflow task log."""
+    if not raw:
+        raise ValueError(f"empty file: {filename!r}")
+    if not filename or not filename.strip():
+        raise ValueError("filename is required")
+    if source_type not in SOURCE_REGISTRY:
+        raise ValueError(f"no DocumentSource registered for {source_type}")
+
 
 async def extract(
     raw: bytes, filename: str, source_type: SourceType
 ) -> tuple[Document, list[tuple[str | None, str]]]:
-    source = SOURCE_REGISTRY.get(source_type)
-    if source is None:
-        raise ValueError(f"no DocumentSource registered for {source_type}")
+    validate_document(raw, filename, source_type)
+    source = SOURCE_REGISTRY[source_type]
     return await source.parse(raw, filename)
 
 
@@ -133,3 +148,18 @@ async def embed_and_load_batch(payloads: list[dict | None]) -> list[dict]:
             {"document_id": document_id, "title": document.title, "chunks_indexed": indexed}
         )
     return results
+
+
+def notify_success(results: list[dict]) -> None:
+    """Final DAG step: log a structured summary of what this batch ingested.
+
+    ponytail: just `logging` (visible in the Airflow task log/UI) — swap in a
+    Slack/email hook here later if the batch needs to page someone.
+    """
+    for result in results:
+        _logger.info(
+            "ingested document_id=%s title=%r chunks_indexed=%d",
+            result["document_id"],
+            result["title"],
+            result["chunks_indexed"],
+        )

@@ -57,6 +57,9 @@ class Settings(BaseSettings):
     airflow_user: str = "airflow"
     airflow_password: str = "airflow"
 
+    # ── Search ──
+    search_top_k: int = 10
+
     @property
     def postgres_dsn(self) -> str:
         # psycopg2, not psycopg3: Airflow's own bundled SQLAlchemy is pinned

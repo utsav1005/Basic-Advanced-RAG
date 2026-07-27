@@ -13,6 +13,7 @@ from src.config import settings
 from src.routers.health import router as health_router
 from src.routers.ingest import router as ingest_router
 from src.routers.papers import router as papers_router
+from src.routers.search import router as search_router
 from src.services.opensearch.client import ensure_index
 
 
@@ -33,3 +34,4 @@ app = FastAPI(
 app.include_router(health_router)
 app.include_router(ingest_router)
 app.include_router(papers_router)
+app.include_router(search_router)

@@ -68,7 +68,7 @@ Industry_graded_project/
 │   │   ├── __init__.py
 │   │   ├── document.py               # Document, Chunk, Citation, SourceType  ✅ DONE
 │   │   ├── agent_state.py            # LangGraph TypedDict                    ✅ DONE
-│   │   ├── search.py                 # SearchQuery, SearchResult              ❌ TODO Step 1.5
+│   │   ├── search.py                 # SearchQuery, SearchResult              ✅ DONE
 │   │   └── ask.py                    # AskRequest, AskResponse                ❌ TODO Step 1.7
 │   │
 │   ├── routers/                      # HTTP endpoints ONLY — no logic
@@ -76,7 +76,7 @@ Industry_graded_project/
 │   │   ├── health.py                 # GET /health                            ✅ DONE (expand 1.3)
 │   │   ├── ingest.py                 # POST /ingest                           ✅ DONE
 │   │   ├── papers.py                 # GET /papers, /papers/{id}              ✅ DONE
-│   │   ├── search.py                 # GET /search                            ❌ TODO Step 1.5
+│   │   ├── search.py                 # GET /search                            ✅ DONE
 │   │   ├── hybrid_search.py          # GET /hybrid-search                     ❌ TODO Step 1.6
 │   │   ├── ask.py                    # POST /ask, /stream                     ❌ TODO Step 1.7
 │   │   └── agentic_ask.py            # POST /agentic-ask                      ❌ TODO Step 1.8
@@ -118,7 +118,7 @@ Industry_graded_project/
 │   │   ├── storage/                  # Postgres persistence
 │   │   │   └── repository.py         # Document upsert + arXiv dedup          ✅ DONE
 │   │   │
-│   │   ├── search/                   # Search logic                            ❌ TODO Step 1.5-1.6
+│   │   ├── search/                   # Search logic                            ✅ BM25 done (1.5), hybrid ❌ TODO (1.6)
 │   │   │   ├── bm25_search.py
 │   │   │   ├── vector_search.py
 │   │   │   └── hybrid_search.py
@@ -201,19 +201,29 @@ Industry_graded_project/
 - `src/config.py`: Pydantic BaseSettings with postgres, opensearch, embedding, airflow configs
 - `src/main.py`: FastAPI with lifespan (ensures OpenSearch index on boot), mounts health + ingest routers
 
-## ✅ Full Ingestion Pipeline (Step 1.4 done — batch-reworked 2026-07-26)
+## ✅ Full Ingestion Pipeline (Step 1.4 done — batch-reworked 2026-07-26; workflow-aligned 2026-07-27)
 - **Pipeline**: `src/services/ingestion/pipeline.py` — `extract_and_chunk` (phase 1) +
   `embed_and_load_batch` (phase 2). `extract`/`transform`/`load`/`run_ingest` still exist
   as the single-document path.
 - **6 Source Parsers**: ArxivSource, PDFSource, MarkdownSource, HTMLSource, WordSource, TextSource
-- **Chunker**: Structure-aware (heading-based packing) + recursive-window (plain text), 512-token budget, overlap
+- **Validation**: `pipeline.validate_document()` — empty bytes / blank filename / unknown
+  source_type, called first inside `extract()` (covers both the sync path and phase 1).
+- **Classification**: `src/services/ingestion/classifier.py` —
+  `classify_document_type()` picks `RESEARCH` vs `API_DOCS` by heading keywords + fenced
+  code-block density (content-based, independent of file format). Only applied to
+  headinged formats; `TEXT` skips straight to `recursive_window`.
+- **Chunker**: `structure_aware` (research — tables kept atomic) and `api_docs_chunker`
+  (same packing, fenced code blocks ALSO kept atomic) + `recursive_window` (plain text).
+  512-token budget, overlap. `chunk_document()` dispatches on format then classification;
+  `_clean()` normalizes blank-line runs before packing.
 - **Embedder**: jina-embeddings-v3 in-process, truncated to 768-d, `retrieval.passage`
   LoRA adapter, async batched, L2-normalized
 - **OpenSearch Client**: kNN + BM25 index mapping, bulk indexing, dedup by chunk_id
 - **Postgres Repository**: Document upsert with ON CONFLICT for arXiv dedup, plus
   `document_exists()` for the pre-embed early-out
 - **Airflow DAGs**: both are two-phase — a parallel `expand()`ed parse phase feeding ONE
-  serialized embed+load task in the `embedding` pool (1 slot)
+  serialized embed+load task in the `embedding` pool (1 slot), followed by a
+  `notify_success` task (`pipeline.notify_success()`) that logs a per-document summary.
 - **Ingest Router**: POST /ingest takes `files: list[UploadFile]`, writes them to the
   shared volume, triggers ONE DAG run, returns 202
 
@@ -261,7 +271,7 @@ Industry_graded_project/
 | 1.2 | Docker Compose networking, Makefile, OpenSearch Dashboards | ❌ TODO |
 | 1.3 | Expand config, aggregated health, exceptions, middleware | ❌ TODO |
 | 1.4 | Verify ingestion E2E, add GET /papers endpoint | ✅ DONE 2026-07-26 (papers router added; pipeline migrated to jina-v3 @768, DAGs reworked to two-phase batch, `embedding` pool added) |
-| 1.5 | BM25 search with metadata filters | ❌ TODO |
+| 1.5 | BM25 search with metadata filters | ✅ DONE 2026-07-27 |
 | 1.6 | Vector search + hybrid search (RRF fusion) | ❌ TODO |
 | 1.7 | RAG pipeline — Ollama + streaming SSE | ❌ TODO |
 | 1.8 | Agentic RAG (LangGraph) + Gradio + Telegram | ❌ TODO |
@@ -275,6 +285,40 @@ Industry_graded_project/
 # =====================================================
 # 6. DOCKER NETWORKING FUNDAMENTALS
 # =====================================================
+
+## ⚠️ CURRENT RUNTIME TOPOLOGY (2026-07-27 — dev machine has <8GB for Docker)
+
+The diagram below is the ORIGINAL 7-service all-Docker design from
+`implementation_plan.md`. On this dev machine it doesn't fit — Docker Desktop's
+RAM budget isn't enough for OpenSearch + Postgres + Airflow (webserver +
+scheduler) + the app container (which alone peaks ~5.4GB loading jina-v3) all
+at once. Actual split in use right now:
+
+| Service | Runs on | Why |
+|---|---|---|
+| Postgres, Redis, OpenSearch, OpenSearch Dashboards, Airflow (init/webserver/scheduler) | **Docker** (`infrastructure/docker-compose.yml`) | Unchanged from the plan — these are fine containerized. |
+| **FastAPI app** | **Host** (`uv run uvicorn src.main:app --reload`, from project root) | Loads jina-v3 in-process (~5.4GB RSS) — no Docker RAM headroom left for it. |
+| **Ollama** | **Host** (installed natively on Windows) | Same reason — a model runtime doesn't fit alongside everything else in Docker. |
+
+Consequences of this split:
+- `.env` uses `localhost:<port>` for every service (already the default in
+  `src/config.py` and `.env.example`) — that's correct from the HOST's point
+  of view. If the app is ever moved back into Docker, these need to become
+  service names (`postgres`, `opensearch`, etc.) again — see the commented-out
+  `app`/`ollama` blocks in `docker-compose.yml`.
+- **`INBOX_DIR`** can no longer be the old `/inbox` (a Docker-only path with no
+  meaning on the host). It's now `./data/inbox`, a bind mount
+  (`../data/inbox:/opt/airflow/inbox` in `docker-compose.yml`) — a real folder
+  on disk both the host app and the Airflow container can see. This replaced
+  the old `ingest_inbox` **named volume**, which is invisible from the host
+  filesystem — named volumes only work when every writer/reader is itself a
+  container.
+- Run `uvicorn` **from the project root** so the relative `./data/inbox` path
+  resolves correctly.
+- `app.Dockerfile` and the `app`/`ollama` compose blocks are preserved
+  (commented out), not deleted — flip this back to all-Docker later by
+  uncommenting them, moving `INBOX_DIR` back to `/inbox`, and restoring
+  service-name URLs.
 
 ## How Containers Talk to Each Other
 
@@ -305,7 +349,7 @@ Industry_graded_project/
     localhost:9200 (OpenSearch)
     localhost:5601 (Dashboards)
     localhost:5432 (Postgres)
-    localhost:6379 (Redis)
+    localhost:6380 (Redis — remapped from default 6379, already used by another local project)
     localhost:11434 (Ollama)
 ```
 
@@ -580,7 +624,7 @@ uv run pytest tests/ --cov=src --cov-report=term-missing
 | POST   | `/ingest`         | ✅ DONE   | 1.4  | Upload 1..N files → ONE Airflow DAG run |
 | GET    | `/papers`         | ✅ DONE   | 1.4  | List ingested documents             |
 | GET    | `/papers/{id}`    | ✅ DONE   | 1.4  | Single document metadata            |
-| GET    | `/search`         | ❌ TODO   | 1.5  | BM25 keyword search + filters      |
+| GET    | `/search`         | ✅ DONE   | 1.5  | BM25 keyword search + filters      |
 | GET    | `/hybrid-search`  | ❌ TODO   | 1.6  | BM25 + vector + RRF hybrid         |
 | POST   | `/ask`            | ❌ TODO   | 1.7  | RAG — synchronous answer            |
 | POST   | `/stream`         | ❌ TODO   | 1.7  | RAG — SSE streaming                 |
@@ -619,7 +663,7 @@ uv run pytest tests/ --cov=src --cov-report=term-missing
 **To be added in Step 1.3**:
 | Field | Env Var | Default | Used By |
 |-------|---------|---------|---------|
-| `redis_url` | `REDIS_URL` | `redis://localhost:6379/0` | Cache client |
+| `redis_url` | `REDIS_URL` | `redis://localhost:6380/0` | Cache client |
 | `ollama_base_url` | `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama client |
 | `ollama_model` | `OLLAMA_MODEL` | `mistral:7b-instruct` | RAG generation |
 | `search_top_k` | `SEARCH_TOP_K` | `10` | Default search results |

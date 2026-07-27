@@ -13,6 +13,14 @@ class SourceType(StrEnum):
     TEXT = "text"
 
 
+class DocumentCategory(StrEnum):
+    """Content-based classification (independent of file format) — decides
+    which chunker fits the document's actual structure."""
+
+    RESEARCH = "research"
+    API_DOCS = "api_docs"
+
+
 class Document(BaseModel):
     id: str
     title: str

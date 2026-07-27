@@ -1,12 +1,13 @@
-"""Chunking strategies — pick one per source type via CHUNK_STRATEGY.
+"""Chunking strategies — dispatched by format, then by content classification.
 
-`chunk_document(doc, sections, source_type)` dispatches:
-  - structure-aware (headinged docs: md/html/word/pdf/arxiv) — respects
-    section headings, packs paragraph/table units up to a token budget on
-    clean boundaries (never mid-word), prepends section context to the
-    embedded text (contextual retrieval).
-  - recursive-window (plain text, no headings) — paragraph -> sentence ->
-    token windows with overlap.
+`chunk_document(doc, sections, source_type)`:
+  - `TEXT` (no headings) -> recursive-window: paragraph -> sentence -> token
+    windows with overlap. Classification is meaningless without headings.
+  - Everything else -> `classify_document_type` picks one of:
+      - structure-aware (research papers) — packs paragraph/table units up to
+        a token budget on clean boundaries, tables kept atomic.
+      - api-docs chunker — same packing, but fenced code blocks are ALSO kept
+        atomic (a code sample split mid-block is useless).
 
 Each Chunk carries `text` (clean body for citations) and `embed_text`
 ("title > heading\\n\\nbody") — the vector is built from `embed_text`.
@@ -14,11 +15,11 @@ Each Chunk carries `text` (clean body for citations) and `embed_text`
 
 import re
 import uuid
-from collections.abc import Callable
 
 import tiktoken
 
-from src.schemas.document import Chunk, Document, SourceType
+from src.schemas.document import Chunk, Document, DocumentCategory, SourceType
+from src.services.ingestion.classifier import classify_document_type
 
 _ENCODING = tiktoken.get_encoding("cl100k_base")
 TARGET_TOKENS = 512
@@ -51,16 +52,38 @@ def _make_chunk(document: Document, body: str, position: int, heading: str | Non
     )
 
 
-def _split_units(text: str) -> list[str]:
+def _clean(text: str) -> str:
+    """Collapse runs of 3+ blank lines to one, strip trailing whitespace per
+    line. Cheap normalization — the real cleanup already happened in each
+    DocumentSource's parse(); this just tidies what's left before packing."""
+    lines = [line.rstrip() for line in text.splitlines()]
+    cleaned: list[str] = []
+    blank_run = 0
+    for line in lines:
+        if line == "":
+            blank_run += 1
+            if blank_run > 1:
+                continue
+        else:
+            blank_run = 0
+        cleaned.append(line)
+    return "\n".join(cleaned)
+
+
+def _split_units(text: str, protect_code_fences: bool = False) -> list[str]:
     """Split a section body into atomic units for packing.
 
     A contiguous run of markdown table lines (`|...|`) is ONE unit — a table
-    is never split across chunks. Everything else splits on blank lines
-    (paragraphs).
+    is never split across chunks. When `protect_code_fences` is set, a
+    ```` ``` ````-delimited block is ALSO one unit (used for API docs, where
+    splitting a code sample mid-block makes it useless). Everything else
+    splits on blank lines (paragraphs).
     """
     units: list[str] = []
     table: list[str] = []
     para: list[str] = []
+    code: list[str] = []
+    in_code = False
 
     def flush_para() -> None:
         if para:
@@ -72,7 +95,27 @@ def _split_units(text: str) -> list[str]:
             units.append("\n".join(table))
             table.clear()
 
+    def flush_code() -> None:
+        if code:
+            units.append("\n".join(code))
+            code.clear()
+
     for line in text.splitlines():
+        if protect_code_fences and line.lstrip().startswith("```"):
+            if in_code:
+                code.append(line)
+                flush_code()
+                in_code = False
+            else:
+                flush_para()
+                flush_table()
+                code.append(line)
+                in_code = True
+            continue
+        if in_code:
+            code.append(line)
+            continue
+
         is_table = line.lstrip().startswith("|")
         if is_table:
             flush_para()
@@ -83,6 +126,7 @@ def _split_units(text: str) -> list[str]:
         else:
             flush_table()
             para.append(line)
+    flush_code()
     flush_table()
     flush_para()
     return [u for u in units if u]
@@ -156,10 +200,24 @@ def _token_windows(text: str) -> list[str]:
 
 
 def structure_aware(document: Document, sections: list[tuple[str | None, str]]) -> list[Chunk]:
+    """Research-paper chunker — tables kept atomic, no code-fence handling
+    (research papers rarely embed fenced code)."""
     chunks: list[Chunk] = []
     position = 0
     for heading, text in sections:
-        for window in _pack(_split_units(text)):
+        for window in _pack(_split_units(_clean(text))):
+            chunks.append(_make_chunk(document, window, position, heading))
+            position += 1
+    return chunks
+
+
+def api_docs_chunker(document: Document, sections: list[tuple[str | None, str]]) -> list[Chunk]:
+    """API-docs chunker — same packing as `structure_aware`, but fenced code
+    blocks are ALSO kept atomic so a code sample never splits mid-block."""
+    chunks: list[Chunk] = []
+    position = 0
+    for heading, text in sections:
+        for window in _pack(_split_units(_clean(text), protect_code_fences=True)):
             chunks.append(_make_chunk(document, window, position, heading))
             position += 1
     return chunks
@@ -170,27 +228,28 @@ def recursive_window(document: Document, sections: list[tuple[str | None, str]])
     recurse paragraph -> sentence -> token window."""
     text = "\n\n".join(t for _, t in sections)
     chunks: list[Chunk] = []
-    for position, window in enumerate(_pack(_split_units(text))):
+    for position, window in enumerate(_pack(_split_units(_clean(text)))):
         chunks.append(_make_chunk(document, window, position, None))
     return chunks
-
-
-CHUNK_STRATEGY: dict[SourceType, Callable[[Document, list[tuple[str | None, str]]], list[Chunk]]] = {
-    SourceType.MARKDOWN: structure_aware,
-    SourceType.HTML: structure_aware,
-    SourceType.WORD: structure_aware,
-    SourceType.PDF: structure_aware,
-    SourceType.ARXIV: structure_aware,
-    SourceType.TEXT: recursive_window,
-}
 
 
 def chunk_document(
     document: Document, sections: list[tuple[str | None, str]], source_type: SourceType | None = None
 ) -> list[Chunk]:
-    """Dispatch to the strategy for `source_type` (defaults to the document's)."""
-    strategy = CHUNK_STRATEGY.get(source_type or document.source_type, structure_aware)
-    return strategy(document, sections)
+    """Dispatch by format, then by content classification.
+
+    `TEXT` has no headings, so classification is skipped — recursive_window
+    is the only chunker that makes sense there. Everything else is
+    classified (research vs. API docs) and routed to the matching chunker.
+    """
+    effective_type = source_type or document.source_type
+    if effective_type is SourceType.TEXT:
+        return recursive_window(document, sections)
+
+    category = classify_document_type(document, sections)
+    if category is DocumentCategory.API_DOCS:
+        return api_docs_chunker(document, sections)
+    return structure_aware(document, sections)
 
 
 if __name__ == "__main__":
@@ -222,4 +281,12 @@ if __name__ == "__main__":
     assert len(plain) > 1
     assert all(c.token_count <= TARGET_TOKENS for c in plain)
 
-    print("structure_chunker: OK —", len(long_chunks), "long,", len(tchunks), "table,", len(plain), "plain")
+    # API-docs heading routes to api_docs_chunker; fenced code stays intact
+    code = "See below.\n\n```python\ndef f():\n    return 1\n```\n\nDone."
+    api_chunks = chunk_document(doc, [("Parameters", code)])
+    assert any("```python" in c.text and "return 1" in c.text for c in api_chunks), "code fence split!"
+
+    print(
+        "structure_chunker: OK —", len(long_chunks), "long,", len(tchunks), "table,",
+        len(plain), "plain,", len(api_chunks), "api-docs",
+    )

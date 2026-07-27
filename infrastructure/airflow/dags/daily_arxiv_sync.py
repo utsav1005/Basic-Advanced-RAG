@@ -66,7 +66,13 @@ def daily_arxiv_sync():
 
         return asyncio.run(embed_and_load_batch(payloads))
 
-    embed_and_load_task(fetch_and_extract.expand(arxiv_id=list_ids()))
+    @task
+    def notify_success_task(results: list[dict]) -> None:
+        from src.services.ingestion.pipeline import notify_success
+
+        notify_success(results)
+
+    notify_success_task(embed_and_load_task(fetch_and_extract.expand(arxiv_id=list_ids())))
 
 
 daily_arxiv_sync()

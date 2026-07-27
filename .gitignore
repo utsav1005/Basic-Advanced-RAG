@@ -13,6 +13,9 @@ wheels/
 # Secrets — never commit
 .env
 
+# Runtime upload inbox (shared with Airflow via bind mount)
+data/inbox/
+
 .claude
 .github
 
